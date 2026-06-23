@@ -5,6 +5,7 @@ LOGGER = logging.getLogger("plugins.eventslotarr")
 
 _scheduler_thread = None
 _stop_scheduler = threading.Event()
+_last_settings = {}
 
 from .assignment import (
     assign_events_to_slots,
@@ -82,8 +83,8 @@ class Plugin:
                 "id": "event_timezone",
                 "label": "Event / EPG Timezone",
                 "type": "string",
-                "default": "local",
-                "help_text": "Use 'local' to read the container/system TZ environment variable, or set an IANA timezone like America/Sao_Paulo."
+                "default": "America/Sao_Paulo",
+                "help_text": "Use an IANA timezone like America/Sao_Paulo, or 'local' to read the container TZ environment variable."
             },
             {
                 "id": "event_duration_hours",
@@ -124,15 +125,19 @@ class Plugin:
         ]
 
     def _resolve_settings(self, settings, context=None):
+        global _last_settings
+
         if settings:
-            return settings
+            _last_settings = dict(settings)
+            return _last_settings
 
         if isinstance(context, dict):
             ctx_settings = context.get("settings")
             if ctx_settings:
-                return ctx_settings
+                _last_settings = dict(ctx_settings)
+                return _last_settings
 
-        return {}
+        return dict(_last_settings)
 
     def run(self, action, settings=None, context=None):
         settings = self._resolve_settings(settings or {}, context)
@@ -181,7 +186,8 @@ class Plugin:
             f"Settings keys: {', '.join(settings.keys()) if settings else '(none)'}",
             f"source_groups: {settings.get('source_groups')!r}",
             f"auto_discover_groups: {settings.get('auto_discover_groups')!r}",
-            f"event_timezone: {settings.get('event_timezone', 'local')!r}",
+            f"event_timezone: {settings.get('event_timezone', 'America/Sao_Paulo')!r}",
+            f"refresh_minutes: {settings.get('refresh_minutes', 1)!r}",
             f"{len(groups)} source groups resolved:"
         ]
 
@@ -239,6 +245,10 @@ class Plugin:
 
     def restart_scheduler(self, settings):
         global _scheduler_thread
+        global _last_settings
+
+        if settings:
+            _last_settings = dict(settings)
 
         if _scheduler_thread and _scheduler_thread.is_alive():
             _stop_scheduler.set()
@@ -252,7 +262,7 @@ class Plugin:
 
         _scheduler_thread = threading.Thread(
             target=scheduler_loop,
-            args=(settings, _stop_scheduler),
+            args=(lambda: dict(_last_settings), _stop_scheduler),
             daemon=True
         )
 

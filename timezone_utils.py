@@ -2,7 +2,6 @@ import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-
 DEFAULT_TIMEZONE = "America/Sao_Paulo"
 
 
@@ -11,12 +10,14 @@ def get_timezone(params=None):
 
     timezone_name = str(
         params.get("event_timezone")
-        or params.get("timezone")
-        or "local"
+        or DEFAULT_TIMEZONE
     ).strip()
 
     if not timezone_name or timezone_name.lower() in ("local", "system", "env"):
         timezone_name = os.environ.get("TZ") or DEFAULT_TIMEZONE
+
+    if timezone_name.upper() == "UTC":
+        timezone_name = DEFAULT_TIMEZONE
 
     try:
         return ZoneInfo(timezone_name)
@@ -30,7 +31,6 @@ def now_local(params=None):
 
 def parse_today_time(params, event_time):
     now = now_local(params)
-
     hour, minute = str(event_time).strip().split(":")
 
     return now.replace(
@@ -53,19 +53,8 @@ def ensure_local(dt, params=None):
 def day_bounds(params=None):
     now = now_local(params)
 
-    day_start = now.replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0
+    return (
+        now.replace(hour=0, minute=0, second=0, microsecond=0),
+        now.replace(hour=23, minute=59, second=59, microsecond=0)
     )
-
-    day_end = now.replace(
-        hour=23,
-        minute=59,
-        second=59,
-        microsecond=0
-    )
-
-    return day_start, day_end
 
