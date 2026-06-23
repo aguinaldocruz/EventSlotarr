@@ -1,26 +1,13 @@
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import timedelta
 
-PLUGIN_TZ = ZoneInfo("America/Sao_Paulo")
-
-
-def now_local():
-    return datetime.now(PLUGIN_TZ).replace(tzinfo=None)
+from .timezone_utils import now_local, parse_today_time
 
 
-def parse_event_time(event_time):
-    now = now_local()
-
+def parse_event_time(params, event_time):
     try:
-        hour, minute = event_time.split(":")
-        return now.replace(
-            hour=int(hour),
-            minute=int(minute),
-            second=0,
-            microsecond=0
-        )
+        return parse_today_time(params, event_time)
     except Exception:
-        return now
+        return now_local(params)
 
 
 def filter_active_events(params, events):
@@ -28,13 +15,15 @@ def filter_active_events(params, events):
     start_offset_minutes = int(params.get("start_offset_minutes", -15))
     stop_offset_minutes = int(params.get("stop_offset_minutes", 30))
 
-    now = now_local()
+    now = now_local(params)
+
     active = []
 
     for event in events:
-        start = parse_event_time(event["time"])
+        start = parse_event_time(params, event["time"])
 
         active_start = start + timedelta(minutes=start_offset_minutes)
+
         active_stop = start + timedelta(
             hours=duration_hours,
             minutes=stop_offset_minutes
@@ -44,5 +33,6 @@ def filter_active_events(params, events):
             active.append(event)
 
     active.sort(key=lambda x: x["time"])
+
     return active
 

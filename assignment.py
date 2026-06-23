@@ -1,15 +1,15 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from apps.channels.models import Channel, ChannelStream
 
 from .channels import bool_setting, ensure_virtual_channels
 from .discovery import discover_groups
-from .events import filter_active_events
 from .failover import choose_best
 from .parser import load_events
 from .state import increment_changes, set_assignments, update_run
-from .sticky import assign_slot, clear_slot, get_slot
+from .sticky import assign_slot, clear_slot
+from .timezone_utils import day_bounds, now_local, parse_today_time
 from .xmltv import save_xmltv
 
 logger = logging.getLogger("EventSlotarr")
@@ -115,19 +115,11 @@ def clear_slots(params):
             increment_changes()
 
 
-def parse_event_datetime(event_time):
-    now = datetime.now()
-
+def parse_event_datetime(params, event_time):
     try:
-        hour, minute = event_time.split(":")
-        return now.replace(
-            hour=int(hour),
-            minute=int(minute),
-            second=0,
-            microsecond=0
-        )
+        return parse_today_time(params, event_time)
     except Exception:
-        return now
+        return now_local(params)
 
 
 def event_duration(params):
@@ -137,23 +129,27 @@ def event_duration(params):
 
 
 def get_event_window(params, event):
-    start = parse_event_datetime(event["time"])
+    start = parse_event_datetime(params, event["time"])
     stop = start + event_duration(params)
 
     return start, stop
 
 
-def build_xmltv_assignment(slot_channel, event, title=None, start=None, stop=None):
-    if start is None or stop is None:
-        start, stop = get_event_window({}, event)
-
-    epg_id = (
+def get_channel_epg_id(slot_channel):
+    return (
         getattr(slot_channel, "tvg_id", None)
         or getattr(slot_channel, "xmltv_id", None)
         or getattr(slot_channel, "channel_id", None)
         or getattr(slot_channel, "channel_number", None)
         or slot_channel.name
     )
+
+
+def build_xmltv_assignment(params, slot_channel, event, title=None, start=None, stop=None):
+    if start is None or stop is None:
+        start, stop = get_event_window(params, event)
+
+    epg_id = get_channel_epg_id(slot_channel)
 
     return {
         "channel_id": str(epg_id),
@@ -201,6 +197,7 @@ def allocate_events_to_slots(params, slot_channels, all_day_events):
 
     for event in sorted_events:
         start, stop = get_event_window(params, event)
+
         placed = False
 
         for slot in slot_channels:
@@ -243,7 +240,8 @@ def find_timeline_item_for_event(timeline, event):
 
 
 def get_current_timeline_items(params, timeline):
-    now = datetime.now()
+    now = now_local(params)
+
     current = []
 
     for slot_name, items in timeline.items():
@@ -256,7 +254,19 @@ def get_current_timeline_items(params, timeline):
 
 def build_next_event_title(next_item):
     event = next_item["event"]
+
     return f"Next event AT {event['time']} - {event['event']}"
+
+
+def build_filler_assignment(slot, title, start, stop):
+    return {
+        "channel_id": str(get_channel_epg_id(slot)),
+        "channel_number": getattr(slot, "channel_number", None),
+        "display_name": slot.name,
+        "event": title,
+        "start": start,
+        "stop": stop
+    }
 
 
 def build_filler_programmes(params, slot_channels, timeline):
@@ -264,11 +274,10 @@ def build_filler_programmes(params, slot_channels, timeline):
     Fill EPG gaps with:
     - Next event AT xx:xx - Title
     - No Live Events Today
+    - No More Live Events Today
     """
 
-    now = datetime.now()
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    day_start, day_end = day_bounds(params)
 
     fillers = {}
 
@@ -279,58 +288,34 @@ def build_filler_programmes(params, slot_channels, timeline):
         )
 
         if not items:
-            fillers[f"{slot.name}-no-events"] = {
-                "channel_id": str(
-                    getattr(slot, "tvg_id", None)
-                    or getattr(slot, "xmltv_id", None)
-                    or getattr(slot, "channel_id", None)
-                    or getattr(slot, "channel_number", None)
-                    or slot.name
-                ),
-                "channel_number": getattr(slot, "channel_number", None),
-                "display_name": slot.name,
-                "event": "No Live Events Today",
-                "start": day_start,
-                "stop": day_end
-            }
+            fillers[f"{slot.name}-no-events"] = build_filler_assignment(
+                slot,
+                "No Live Events Today",
+                day_start,
+                day_end
+            )
             continue
 
         previous_stop = day_start
 
         for idx, item in enumerate(items):
             if previous_stop < item["start"]:
-                fillers[f"{slot.name}-filler-before-{idx}"] = {
-                    "channel_id": str(
-                        getattr(slot, "tvg_id", None)
-                        or getattr(slot, "xmltv_id", None)
-                        or getattr(slot, "channel_id", None)
-                        or getattr(slot, "channel_number", None)
-                        or slot.name
-                    ),
-                    "channel_number": getattr(slot, "channel_number", None),
-                    "display_name": slot.name,
-                    "event": build_next_event_title(item),
-                    "start": previous_stop,
-                    "stop": item["start"]
-                }
+                fillers[f"{slot.name}-filler-before-{idx}"] = build_filler_assignment(
+                    slot,
+                    build_next_event_title(item),
+                    previous_stop,
+                    item["start"]
+                )
 
             previous_stop = item["stop"]
 
         if previous_stop < day_end:
-            fillers[f"{slot.name}-filler-after-last"] = {
-                "channel_id": str(
-                    getattr(slot, "tvg_id", None)
-                    or getattr(slot, "xmltv_id", None)
-                    or getattr(slot, "channel_id", None)
-                    or getattr(slot, "channel_number", None)
-                    or slot.name
-                ),
-                "channel_number": getattr(slot, "channel_number", None),
-                "display_name": slot.name,
-                "event": "No More Live Events Today",
-                "start": previous_stop,
-                "stop": day_end
-            }
+            fillers[f"{slot.name}-filler-after-last"] = build_filler_assignment(
+                slot,
+                "No More Live Events Today",
+                previous_stop,
+                day_end
+            )
 
     return fillers
 
@@ -347,6 +332,7 @@ def build_all_day_xmltv(params, slot_channels, timeline):
             key = f"{slot.name}-{event['time']}-{event['event']}"
 
             xmltv_assignments[key] = build_xmltv_assignment(
+                params,
                 slot,
                 event,
                 title=event["event"],
@@ -372,8 +358,7 @@ def build_all_day_xmltv(params, slot_channels, timeline):
 
 def assign_current_events_from_timeline(params, timeline, slot_channels):
     assignments = []
-    now = datetime.now()
-
+    now = now_local(params)
     occupied_slot_names = set()
 
     for slot in slot_channels:
@@ -425,7 +410,7 @@ def write_xmltv_if_enabled(params, xmltv_assignments):
         f"[EventSlotarr] Writing XMLTV with {len(xmltv_assignments)} programme(s)"
     )
 
-    save_xmltv(output_path, xmltv_assignments)
+    save_xmltv(output_path, xmltv_assignments, params)
 
 
 def assign_events_to_slots(params):

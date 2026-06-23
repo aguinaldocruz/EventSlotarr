@@ -6,14 +6,17 @@ LOGGER = logging.getLogger("plugins.eventslotarr")
 _scheduler_thread = None
 _stop_scheduler = threading.Event()
 
-from .assignment import assign_events_to_slots, clear_slots, get_configured_source_groups
+from .assignment import (
+    assign_events_to_slots,
+    clear_slots,
+    get_configured_source_groups
+)
 from .parser import load_events
 from .preview import preview
 from .scheduler import scheduler_loop
 
 
 class Plugin:
-
     name = "EventSlotarr"
     version = "0.1.0"
     description = "Assign temporary live event streams to placeholder channels."
@@ -76,6 +79,13 @@ class Plugin:
                 "default": 9801
             },
             {
+                "id": "event_timezone",
+                "label": "Event / EPG Timezone",
+                "type": "string",
+                "default": "local",
+                "help_text": "Use 'local' to read the container/system TZ environment variable, or set an IANA timezone like America/Sao_Paulo."
+            },
+            {
                 "id": "event_duration_hours",
                 "label": "Event Duration Hours",
                 "type": "number",
@@ -131,26 +141,38 @@ class Plugin:
         LOGGER.info(f"[EventSlotarr] Settings keys: {list(settings.keys())}")
         LOGGER.info(f"[EventSlotarr] source_groups={settings.get('source_groups')!r}")
         LOGGER.info(f"[EventSlotarr] auto_discover_groups={settings.get('auto_discover_groups')!r}")
+        LOGGER.info(f"[EventSlotarr] event_timezone={settings.get('event_timezone')!r}")
 
         try:
             if action == "validate_settings":
                 return self.validate_settings(settings)
+
             if action == "load_events":
                 return self.load_events_action(settings)
+
             if action == "assign_events":
                 return self.assign_events_action(settings)
+
             if action == "preview":
                 return self.preview_action()
+
             if action == "clear_slots":
                 return self.clear_slots_action(settings)
+
             if action == "update_schedule":
                 return self.update_schedule_action(settings)
 
-            return {"status": "error", "message": f"Unknown action '{action}'"}
+            return {
+                "status": "error",
+                "message": f"Unknown action '{action}'"
+            }
 
         except Exception as ex:
             LOGGER.exception(f"[EventSlotarr] Error running action {action}: {ex}")
-            return {"status": "error", "message": str(ex)}
+            return {
+                "status": "error",
+                "message": str(ex)
+            }
 
     def validate_settings(self, settings):
         groups = get_configured_source_groups(settings)
@@ -159,6 +181,7 @@ class Plugin:
             f"Settings keys: {', '.join(settings.keys()) if settings else '(none)'}",
             f"source_groups: {settings.get('source_groups')!r}",
             f"auto_discover_groups: {settings.get('auto_discover_groups')!r}",
+            f"event_timezone: {settings.get('event_timezone', 'local')!r}",
             f"{len(groups)} source groups resolved:"
         ]
 
@@ -172,7 +195,6 @@ class Plugin:
 
     def load_events_action(self, settings):
         total = 0
-
         lines = []
 
         for group_name in get_configured_source_groups(settings):
@@ -220,6 +242,7 @@ class Plugin:
 
         if _scheduler_thread and _scheduler_thread.is_alive():
             _stop_scheduler.set()
+
             try:
                 _scheduler_thread.join(timeout=5)
             except Exception:
