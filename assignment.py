@@ -15,7 +15,7 @@ from .sticky import assign_slot, clear_slot
 from .timezone_utils import day_bounds, now_local, parse_today_time
 from .xmltv import save_xmltv
 
-logger = logging.getLogger("EventSlotarr")
+logger = logging.getLogger("plugins.eventslotarr")
 
 SCHEDULE_STATE_FILE = "schedule_state.json"
 
@@ -354,6 +354,15 @@ def find_due_item_for_slot(params, items):
     due = None
 
     for item in sorted(items, key=lambda x: x["operational_start"]):
+        logger.info(
+            "[EventSlotarr] Due check: now=%s event=%s start=%s stop=%s load_from=%s keep_until=%s",
+            now,
+            item["event"].get("event"),
+            item["start"],
+            item["stop"],
+            item["operational_start"],
+            item["operational_stop"],
+        )
         if item["operational_start"] <= now <= item["operational_stop"]:
             due = item
 
