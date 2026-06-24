@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 from datetime import timedelta
 
@@ -7,17 +9,22 @@ from .channels import bool_setting, ensure_virtual_channels
 from .discovery import discover_groups
 from .failover import choose_best
 from .parser import load_events
+from .persistence import load_json, save_json
 from .state import increment_changes, set_assignments, update_run
 from .sticky import assign_slot, clear_slot
-from .timezone_utils import (
-    day_bounds,
-    get_timezone,
-    now_local,
-    parse_today_time
-)
+from .timezone_utils import day_bounds, now_local, parse_today_time
 from .xmltv import save_xmltv
 
 logger = logging.getLogger("EventSlotarr")
+
+SCHEDULE_STATE_FILE = "schedule_state.json"
+
+
+def int_setting(params, key, default):
+    try:
+        return int(params.get(key, default))
+    except Exception:
+        return default
 
 
 def get_configured_source_groups(params):
@@ -36,17 +43,14 @@ def get_slot_channels(params):
         return ensure_virtual_channels(params)
 
     slot_channels = []
-
     names = str(params.get("placeholder_channels", "")).replace("\n", ",")
 
     for name in names.split(","):
         name = name.strip()
-
         if not name:
             continue
 
         channel = Channel.objects.filter(name=name).first()
-
         if channel:
             slot_channels.append(channel)
         else:
@@ -57,13 +61,52 @@ def get_slot_channels(params):
 
 def load_all_events_for_day(params):
     events = []
-
     for group_name in get_configured_source_groups(params):
         events.extend(load_events(group_name))
-
     events.sort(key=lambda x: x["time"])
-
     return events
+
+
+def event_source_signature(events):
+    payload = []
+    for event in sorted(events, key=lambda e: (e.get("time"), e.get("event"))):
+        alternatives = []
+        for alt in event.get("alternatives", []):
+            stream = alt.get("stream")
+            alternatives.append(
+                {
+                    "source_name": alt.get("source_name"),
+                    "quality": alt.get("quality"),
+                    "stream_id": getattr(stream, "id", None),
+                    "stream_name": getattr(stream, "name", None),
+                }
+            )
+        payload.append(
+            {
+                "time": event.get("time"),
+                "event": event.get("event"),
+                "alternatives": sorted(alternatives, key=lambda x: str(x)),
+            }
+        )
+
+    data = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def load_schedule_state():
+    return load_json(
+        SCHEDULE_STATE_FILE,
+        {
+            "source_signature": None,
+            "timeline": {},
+            "ignored": [],
+            "last_rebuild": None,
+        },
+    )
+
+
+def save_schedule_state(state):
+    save_json(SCHEDULE_STATE_FILE, state)
 
 
 def channel_stream_ids(channel):
@@ -85,37 +128,25 @@ def replace_stream(slot_channel, source_stream):
         return False
 
     ChannelStream.objects.filter(channel=slot_channel).delete()
+    ChannelStream.objects.create(channel=slot_channel, stream=source_stream, order=0)
 
-    ChannelStream.objects.create(
-        channel=slot_channel,
-        stream=source_stream,
-        order=0
-    )
-
-    logger.info(
-        f"[EventSlotarr] {slot_channel.name}: assigned stream {source_stream.name}"
-    )
-
+    logger.info(f"[EventSlotarr] {slot_channel.name}: assigned stream {source_stream.name}")
     return True
 
 
 def clear_channel(slot_channel):
     qs = ChannelStream.objects.filter(channel=slot_channel)
-
     if not qs.exists():
         return False
 
     qs.delete()
-
     logger.info(f"[EventSlotarr] {slot_channel.name}: cleared")
-
     return True
 
 
 def clear_slots(params):
     for slot_channel in get_slot_channels(params):
         clear_slot(slot_channel.name)
-
         if clear_channel(slot_channel):
             increment_changes()
 
@@ -128,16 +159,26 @@ def parse_event_datetime(params, event_time):
 
 
 def event_duration(params):
-    return timedelta(
-        hours=int(params.get("event_duration_hours", 2))
-    )
+    return timedelta(hours=int_setting(params, "event_duration_hours", 2))
+
+
+def before_event_delta(params):
+    return timedelta(minutes=int_setting(params, "minutes_before_event", 20))
+
+
+def after_event_delta(params):
+    return timedelta(minutes=int_setting(params, "minutes_after_event", 20))
 
 
 def get_event_window(params, event):
     start = parse_event_datetime(params, event["time"])
     stop = start + event_duration(params)
-
     return start, stop
+
+
+def get_operational_window(params, event):
+    start, stop = get_event_window(params, event)
+    return start - before_event_delta(params), stop + after_event_delta(params)
 
 
 def get_channel_epg_id(slot_channel):
@@ -154,13 +195,14 @@ def build_xmltv_assignment(params, slot_channel, event, title=None, start=None, 
     if start is None or stop is None:
         start, stop = get_event_window(params, event)
 
+    epg_id = get_channel_epg_id(slot_channel)
     return {
-        "channel_id": str(get_channel_epg_id(slot_channel)),
+        "channel_id": str(epg_id),
         "channel_number": getattr(slot_channel, "channel_number", None),
         "display_name": slot_channel.name,
         "event": title or event["event"],
         "start": start,
-        "stop": stop
+        "stop": stop,
     }
 
 
@@ -170,55 +212,61 @@ def windows_overlap(start_a, stop_a, start_b, stop_b):
 
 def event_overlaps_slot(slot_items, start, stop):
     for item in slot_items:
-        if windows_overlap(start, stop, item["start"], item["stop"]):
+        if windows_overlap(start, stop, item["operational_start"], item["operational_stop"]):
             return True
-
     return False
 
 
 def allocate_events_to_slots(params, slot_channels, all_day_events):
-    timeline = {
-        slot.name: []
-        for slot in slot_channels
-    }
+    """
+    Allocate events by day timeline.
 
+    Slot 1 is used first. Slot 2 is only used when Slot 1 has an overlapping
+    operational window. The operational window includes minutes_before_event and
+    minutes_after_event so stream changes never collide on the same channel.
+    XMLTV programmes still use the real event start/stop window.
+    """
+    timeline = {slot.name: [] for slot in slot_channels}
     ignored = []
 
-    sorted_events = sorted(
-        all_day_events,
-        key=lambda e: get_event_window(params, e)[0]
-    )
+    sorted_events = sorted(all_day_events, key=lambda e: get_event_window(params, e)[0])
 
     for event in sorted_events:
         start, stop = get_event_window(params, event)
-
+        operational_start, operational_stop = get_operational_window(params, event)
         placed = False
 
         for slot in slot_channels:
             slot_items = timeline[slot.name]
-
-            if not event_overlaps_slot(slot_items, start, stop):
-                slot_items.append({
-                    "event": event,
-                    "start": start,
-                    "stop": stop,
-                    "slot": slot
-                })
-
-                logger.info(
-                    f"[EventSlotarr] Timeline allocation: "
-                    f"{event['time']} - {event['event']} -> {slot.name}"
+            if not event_overlaps_slot(slot_items, operational_start, operational_stop):
+                slot_items.append(
+                    {
+                        "event": event,
+                        "start": start,
+                        "stop": stop,
+                        "operational_start": operational_start,
+                        "operational_stop": operational_stop,
+                        "slot": slot,
+                    }
                 )
-
+                logger.info(
+                    "[EventSlotarr] Timeline allocation: %s - %s -> %s "
+                    "(load from %s, keep until %s)",
+                    event["time"],
+                    event["event"],
+                    slot.name,
+                    operational_start,
+                    operational_stop,
+                )
                 placed = True
                 break
 
         if not placed:
             ignored.append(event)
-
             logger.warning(
-                f"[EventSlotarr] Event ignored because all slots overlap: "
-                f"{event['time']} - {event['event']}"
+                "[EventSlotarr] Event ignored because all slots overlap: %s - %s",
+                event["time"],
+                event["event"],
             )
 
     return timeline, ignored
@@ -226,7 +274,6 @@ def allocate_events_to_slots(params, slot_channels, all_day_events):
 
 def build_next_event_title(next_item):
     event = next_item["event"]
-
     return f"Next event AT {event['time']} - {event['event']}"
 
 
@@ -237,49 +284,43 @@ def build_filler_assignment(slot, title, start, stop):
         "display_name": slot.name,
         "event": title,
         "start": start,
-        "stop": stop
+        "stop": stop,
     }
 
 
 def build_filler_programmes(params, slot_channels, timeline):
     day_start, day_end = day_bounds(params)
-
     fillers = {}
 
     for slot in slot_channels:
-        items = sorted(
-            timeline.get(slot.name, []),
-            key=lambda x: x["start"]
-        )
+        items = sorted(timeline.get(slot.name, []), key=lambda x: x["start"])
 
         if not items:
             fillers[f"{slot.name}-no-events"] = build_filler_assignment(
                 slot,
                 "No Live Events Today",
                 day_start,
-                day_end
+                day_end,
             )
             continue
 
         previous_stop = day_start
-
         for idx, item in enumerate(items):
             if previous_stop < item["start"]:
                 fillers[f"{slot.name}-filler-before-{idx}"] = build_filler_assignment(
                     slot,
                     build_next_event_title(item),
                     previous_stop,
-                    item["start"]
+                    item["start"],
                 )
-
-            previous_stop = item["stop"]
+            previous_stop = max(previous_stop, item["stop"])
 
         if previous_stop < day_end:
             fillers[f"{slot.name}-filler-after-last"] = build_filler_assignment(
                 slot,
                 "No More Live Events Today",
                 previous_stop,
-                day_end
+                day_end,
             )
 
     return fillers
@@ -290,56 +331,48 @@ def build_all_day_xmltv(params, slot_channels, timeline):
 
     for slot in slot_channels:
         items = timeline.get(slot.name, [])
-
         for item in items:
             event = item["event"]
-
             key = f"{slot.name}-{event['time']}-{event['event']}"
-
             xmltv_assignments[key] = build_xmltv_assignment(
                 params,
                 slot,
                 event,
                 title=event["event"],
                 start=item["start"],
-                stop=item["stop"]
+                stop=item["stop"],
             )
 
-    xmltv_assignments.update(
-        build_filler_programmes(params, slot_channels, timeline)
-    )
+    xmltv_assignments.update(build_filler_programmes(params, slot_channels, timeline))
 
-    logger.info(
-        f"[EventSlotarr] Built XMLTV with "
-        f"{len(xmltv_assignments)} programme(s)"
-    )
-
+    logger.info(f"[EventSlotarr] Built XMLTV with {len(xmltv_assignments)} programme(s)")
     return xmltv_assignments
 
 
-def assign_current_events_from_timeline(params, timeline, slot_channels):
-    assignments = []
+def find_due_item_for_slot(params, items):
     now = now_local(params)
-    occupied_slot_names = set()
+    due = None
 
-    logger.info(f"[EventSlotarr] Current local now: {now.isoformat()}")
+    for item in sorted(items, key=lambda x: x["operational_start"]):
+        if item["operational_start"] <= now <= item["operational_stop"]:
+            due = item
+
+    return due
+
+
+def assign_due_events_from_timeline(params, timeline, slot_channels):
+    assignments = []
+    occupied_slot_names = set()
 
     for slot in slot_channels:
         items = timeline.get(slot.name, [])
+        due_item = find_due_item_for_slot(params, items)
 
-        current_item = None
-
-        for item in items:
-            if item["start"] <= now <= item["stop"]:
-                current_item = item
-                break
-
-        if not current_item:
+        if not due_item:
             continue
 
-        event = current_item["event"]
+        event = due_item["event"]
         source = choose_best(event["alternatives"])
-
         assign_slot(event["event"], slot.name)
 
         if replace_stream(slot, source["stream"]):
@@ -351,7 +384,6 @@ def assign_current_events_from_timeline(params, timeline, slot_channels):
     for slot in slot_channels:
         if slot.name not in occupied_slot_names:
             clear_slot(slot.name)
-
             if clear_channel(slot):
                 increment_changes()
 
@@ -368,57 +400,85 @@ def write_xmltv_if_enabled(params, xmltv_assignments):
         return
 
     output_path = params.get("xmltv_output") or "/data/eventslotarr.xml"
-
-    logger.info(
-        f"[EventSlotarr] Writing XMLTV with {len(xmltv_assignments)} programme(s)"
-    )
-
+    logger.info(f"[EventSlotarr] Writing XMLTV with {len(xmltv_assignments)} programme(s)")
     save_xmltv(output_path, xmltv_assignments, params)
 
 
-def assign_events_to_slots(params):
+def rebuild_timeline_and_xmltv(params, all_day_events, slot_channels, signature):
+    timeline, ignored = allocate_events_to_slots(params, slot_channels, all_day_events)
+    all_day_xmltv = build_all_day_xmltv(params, slot_channels, timeline)
+    write_xmltv_if_enabled(params, all_day_xmltv)
+
+    save_schedule_state(
+        {
+            "source_signature": signature,
+            "last_rebuild": now_local(params).isoformat(),
+            "timeline": {},
+            "ignored": [f"{e.get('time')} - {e.get('event')}" for e in ignored],
+        }
+    )
+
+    return timeline, ignored
+
+
+def assign_events_to_slots(params, force_rebuild=False, check_source=True):
     update_run()
 
-    logger.info(f"[EventSlotarr] Active timezone: {get_timezone(params)}")
-    logger.info(f"[EventSlotarr] Active local now: {now_local(params).isoformat()}")
-
     all_day_events = load_all_events_for_day(params)
-
     logger.info(f"[EventSlotarr] Events for day: {len(all_day_events)}")
 
     slot_channels = get_slot_channels(params)
-
     logger.info(f"[EventSlotarr] Slot channels found: {len(slot_channels)}")
 
-    timeline, ignored = allocate_events_to_slots(
-        params,
-        slot_channels,
-        all_day_events
-    )
+    signature = event_source_signature(all_day_events)
+    state = load_schedule_state()
+    source_changed = signature != state.get("source_signature")
 
-    assignments = assign_current_events_from_timeline(
-        params,
-        timeline,
-        slot_channels
-    )
+    if force_rebuild or check_source or source_changed:
+        if force_rebuild or source_changed:
+            logger.info("[EventSlotarr] Source events changed; rebuilding timeline and XMLTV")
+            timeline, ignored = rebuild_timeline_and_xmltv(
+                params,
+                all_day_events,
+                slot_channels,
+                signature,
+            )
+        else:
+            logger.info("[EventSlotarr] Source events unchanged")
+            timeline, ignored = allocate_events_to_slots(params, slot_channels, all_day_events)
+    else:
+        timeline, ignored = allocate_events_to_slots(params, slot_channels, all_day_events)
 
+    assignments = assign_due_events_from_timeline(params, timeline, slot_channels)
     set_assignments(assignments)
 
-    all_day_xmltv = build_all_day_xmltv(
-        params,
-        slot_channels,
-        timeline
-    )
-
-    write_xmltv_if_enabled(
-        params,
-        all_day_xmltv
-    )
-
     logger.info(
-        f"[EventSlotarr] Current assignments: {len(assignments)}, "
-        f"ignored events: {len(ignored)}"
+        "[EventSlotarr] Due assignments: %s, ignored events: %s, source_changed=%s",
+        len(assignments),
+        len(ignored),
+        source_changed,
     )
 
     return assignments
 
+
+def seconds_until_next_slot_change(params):
+    all_day_events = load_all_events_for_day(params)
+    slot_channels = get_slot_channels(params)
+    timeline, ignored = allocate_events_to_slots(params, slot_channels, all_day_events)
+
+    now = now_local(params)
+    next_times = []
+
+    for items in timeline.values():
+        for item in items:
+            if item["operational_start"] > now:
+                next_times.append(item["operational_start"])
+            if item["operational_stop"] > now:
+                next_times.append(item["operational_stop"])
+
+    if not next_times:
+        return None
+
+    next_time = min(next_times)
+    return max(0, int((next_time - now).total_seconds()))
