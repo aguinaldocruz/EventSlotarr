@@ -24,6 +24,32 @@ class Plugin:
     def __init__(self):
         LOGGER.info("[EventSlotarr] Plugin initialized")
 
+    def start(self, settings=None, context=None):
+        """Dispatcharr lifecycle hook, if supported by the installed version.
+
+        Some Dispatcharr versions only instantiate the plugin on startup and do
+        not call a custom action. If they call start/on_start, this makes the
+        scheduler begin automatically after the container starts.
+        """
+        settings = self._resolve_settings(settings or {}, context)
+        if settings:
+            self.ensure_scheduler_running(settings)
+        else:
+            LOGGER.warning(
+                "[EventSlotarr] start() called without settings; scheduler will start on first plugin action"
+            )
+        return {"status": "success", "message": "EventSlotarr startup checked"}
+
+    def on_start(self, settings=None, context=None):
+        return self.start(settings=settings, context=context)
+
+    def stop(self):
+        self.stop_scheduler()
+        return {"status": "success", "message": "EventSlotarr scheduler stopped"}
+
+    def on_stop(self):
+        return self.stop()
+
     @property
     def fields(self):
         return [
@@ -149,6 +175,13 @@ class Plugin:
         LOGGER.info(f"[EventSlotarr] auto_discover_groups={settings.get('auto_discover_groups')!r}")
         LOGGER.info(f"[EventSlotarr] event_timezone={settings.get('event_timezone')!r}")
 
+        # Important: after Dispatcharr/container restart the old in-memory
+        # scheduler thread is gone. Do not wait for the manual update_schedule
+        # button; start it as soon as Dispatcharr calls any plugin action with
+        # saved settings.
+        if action not in ("preview",):
+            self.ensure_scheduler_running(settings)
+
         try:
             if action == "validate_settings":
                 return self.validate_settings(settings)
@@ -210,20 +243,45 @@ class Plugin:
         self.restart_scheduler(settings)
         return {"status": "success", "message": "Scheduler restarted"}
 
-    def restart_scheduler(self, settings):
+    def ensure_scheduler_running(self, settings):
+        global _scheduler_thread
+
+        if not settings:
+            LOGGER.warning("[EventSlotarr] Cannot auto-start scheduler: no settings available")
+            return False
+
+        if _scheduler_thread and _scheduler_thread.is_alive():
+            return True
+
+        LOGGER.info("[EventSlotarr] Scheduler is not running; starting automatically")
+        self.restart_scheduler(settings)
+        return True
+
+    def stop_scheduler(self):
         global _scheduler_thread
 
         if _scheduler_thread and _scheduler_thread.is_alive():
+            LOGGER.info("[EventSlotarr] Stopping scheduler")
             _stop_scheduler.set()
             try:
                 _scheduler_thread.join(timeout=5)
             except Exception:
-                pass
+                LOGGER.exception("[EventSlotarr] Error while stopping scheduler")
+
+        _scheduler_thread = None
+        _stop_scheduler.clear()
+
+    def restart_scheduler(self, settings):
+        global _scheduler_thread
+
+        self.stop_scheduler()
 
         _stop_scheduler.clear()
         _scheduler_thread = threading.Thread(
             target=scheduler_loop,
-            args=(settings, _stop_scheduler),
+            args=(dict(settings or {}), _stop_scheduler),
             daemon=True,
+            name="EventSlotarrScheduler",
         )
         _scheduler_thread.start()
+        LOGGER.info("[EventSlotarr] Scheduler thread started")
