@@ -14,35 +14,30 @@ from .assignment import (
     assign_events_to_slots,
     clear_slots,
     get_configured_source_groups,
+    get_next_scheduled_event,
 )
 from .parser import load_events
-from .preview import preview
 from .scheduler import scheduler_loop
 
 
 class Plugin:
     name = "EventSlotarr"
-    version = "0.2.1"
+    version = "0.2.3"
     description = "Assign temporary live event streams to placeholder channels."
 
     actions = [
-        {"id": "validate_settings", "label": "Validate Settings"},
-        {"id": "load_events", "label": "Load Events"},
         {"id": "assign_events", "label": "Assign Events Now"},
-        {"id": "preview", "label": "Preview"},
+        {"id": "next_scheduled_event", "label": "Next Scheduled Event"},
         {"id": "clear_slots", "label": "Clear Slots"},
-        {"id": "update_schedule", "label": "Restart Scheduler"},
         {"id": "schedule_status", "label": "Scheduler Status"},
     ]
 
     def __init__(self):
         LOGGER.info("[EventSlotarr] Plugin initialized")
 
-        # Dispatcharr currently guarantees Plugin() instantiation when the
-        # plugin is enabled, but it does NOT guarantee a start()/on_start()
-        # lifecycle call. Therefore the scheduler must be started here.
         try:
             settings = self._load_persisted_settings()
+
             if settings:
                 self.ensure_scheduler_running(settings)
             else:
@@ -50,6 +45,7 @@ class Plugin:
                     "[EventSlotarr] Plugin initialized but no persisted settings were found; "
                     "scheduler will start on first plugin action"
                 )
+
         except Exception:
             LOGGER.exception("[EventSlotarr] Failed during scheduler autostart")
 
@@ -112,7 +108,7 @@ class Plugin:
                 "label": "Event / EPG Timezone",
                 "type": "string",
                 "default": "local",
-                "help_text": "Use 'local' to read the container/system TZ environment variable, or set an IANA timezone like America/Sao_Paulo.",
+                "help_text": "Use 'local' or an IANA timezone like America/Sao_Paulo.",
             },
             {
                 "id": "event_duration_hours",
@@ -125,14 +121,12 @@ class Plugin:
                 "label": "Look for source event changes every N minutes",
                 "type": "number",
                 "default": 30,
-                "help_text": "Scheduler checks source groups for changes on this interval.",
             },
             {
                 "id": "beginning_day_time",
                 "label": "Beginning day time",
                 "type": "string",
                 "default": "00:00",
-                "help_text": "Daily source-change checking starts at this local time. Use HH:MM, default midnight.",
             },
             {
                 "id": "minutes_before_event",
@@ -158,14 +152,33 @@ class Plugin:
                 "type": "string",
                 "default": "/data/eventslotarr.xml",
             },
+            {
+                "id": "refresh_plex_on_epg_change",
+                "label": "Refresh Plex TV Guide when EPG changes",
+                "type": "boolean",
+                "default": False,
+            },
+            {
+                "id": "plex_url",
+                "label": "Plex Server URL",
+                "type": "string",
+                "default": "",
+                "help_text": "Example: http://192.168.15.15:32400",
+            },
+            {
+                "id": "plex_token",
+                "label": "Plex Token",
+                "type": "string",
+                "default": "",
+            },
         ]
 
     def _default_settings(self):
-        defaults = {}
-        for field in self.fields:
-            if "id" in field and "default" in field:
-                defaults[field["id"]] = field["default"]
-        return defaults
+        return {
+            field["id"]: field["default"]
+            for field in self.fields
+            if "id" in field and "default" in field
+        }
 
     def _merge_defaults(self, settings):
         merged = self._default_settings()
@@ -173,12 +186,6 @@ class Plugin:
         return merged
 
     def _load_persisted_settings(self):
-        """Load saved settings directly from Dispatcharr's PluginConfig table.
-
-        This is needed because Dispatcharr does not call a guaranteed startup
-        hook for plugins. The plugin key normally comes from the folder name,
-        usually 'eventslotarr'.
-        """
         try:
             from apps.plugins.models import PluginConfig
         except Exception:
@@ -198,6 +205,7 @@ class Plugin:
         for key in candidates:
             try:
                 config = PluginConfig.objects.filter(key=key, enabled=True).first()
+
                 if config:
                     break
             except Exception:
@@ -214,16 +222,10 @@ class Plugin:
                 config = None
 
         if not config:
-            LOGGER.warning("[EventSlotarr] No enabled PluginConfig found for persisted settings")
+            LOGGER.warning("[EventSlotarr] No enabled PluginConfig found")
             return {}
 
-        settings = self._merge_defaults(config.settings or {})
-        LOGGER.info(
-            "[EventSlotarr] Loaded persisted settings from PluginConfig key=%s with keys=%s",
-            config.key,
-            sorted(settings.keys()),
-        )
-        return settings
+        return self._merge_defaults(config.settings or {})
 
     def _resolve_settings(self, settings=None, context=None):
         if settings:
@@ -231,6 +233,7 @@ class Plugin:
 
         if isinstance(context, dict):
             ctx_settings = context.get("settings")
+
             if ctx_settings:
                 return self._merge_defaults(ctx_settings)
 
@@ -239,6 +242,7 @@ class Plugin:
     def start(self, settings=None, context=None):
         settings = self._resolve_settings(settings, context)
         self.ensure_scheduler_running(settings)
+
         return {"status": "success", "message": "EventSlotarr startup checked"}
 
     def on_start(self, settings=None, context=None):
@@ -246,6 +250,7 @@ class Plugin:
 
     def stop(self, context=None):
         self.stop_scheduler()
+
         return {"status": "success", "message": "EventSlotarr scheduler stopped"}
 
     def on_stop(self, context=None):
@@ -255,27 +260,20 @@ class Plugin:
         settings = self._resolve_settings(params or {}, context)
 
         LOGGER.info("[EventSlotarr] Action: %s", action)
-        LOGGER.info("[EventSlotarr] Settings keys: %s", list(settings.keys()))
-        LOGGER.info("[EventSlotarr] source_groups=%r", settings.get("source_groups"))
-        LOGGER.info("[EventSlotarr] auto_discover_groups=%r", settings.get("auto_discover_groups"))
-        LOGGER.info("[EventSlotarr] event_timezone=%r", settings.get("event_timezone"))
 
-        if action not in ("preview", "schedule_status"):
+        if action not in ("schedule_status", "next_scheduled_event"):
             self.ensure_scheduler_running(settings)
 
         try:
-            if action == "validate_settings":
-                return self.validate_settings(settings)
-            if action == "load_events":
-                return self.load_events_action(settings)
             if action == "assign_events":
                 return self.assign_events_action(settings)
-            if action == "preview":
-                return self.preview_action()
+
+            if action == "next_scheduled_event":
+                return self.next_scheduled_event_action(settings)
+
             if action == "clear_slots":
                 return self.clear_slots_action(settings)
-            if action == "update_schedule":
-                return self.update_schedule_action(settings)
+
             if action == "schedule_status":
                 return self.schedule_status_action(settings)
 
@@ -285,51 +283,36 @@ class Plugin:
             LOGGER.exception("[EventSlotarr] Error running action %s: %s", action, ex)
             return {"status": "error", "message": str(ex)}
 
-    def validate_settings(self, settings):
-        groups = get_configured_source_groups(settings)
-        message = [
-            f"Settings keys: {', '.join(settings.keys()) if settings else '(none)'}",
-            f"source_groups: {settings.get('source_groups')!r}",
-            f"auto_discover_groups: {settings.get('auto_discover_groups')!r}",
-            f"event_timezone: {settings.get('event_timezone', 'local')!r}",
-            f"source_change_check_minutes: {settings.get('source_change_check_minutes', 30)!r}",
-            f"beginning_day_time: {settings.get('beginning_day_time', '00:00')!r}",
-            f"minutes_before_event: {settings.get('minutes_before_event', 20)!r}",
-            f"minutes_after_event: {settings.get('minutes_after_event', 20)!r}",
-            f"{len(groups)} source groups resolved:",
-        ]
-        for group in groups:
-            message.append(f"- {group}")
-        return {"status": "success", "message": "\n".join(message)}
-
-    def load_events_action(self, settings):
-        total = 0
-        lines = []
-        for group_name in get_configured_source_groups(settings):
-            events = load_events(group_name)
-            total += len(events)
-            lines.append(f"{group_name}: {len(events)} event(s)")
-        return {"status": "success", "message": f"{total} events loaded\n" + "\n".join(lines)}
-
     def assign_events_action(self, settings):
-        assignments = assign_events_to_slots(settings, force_rebuild=True, check_source=True)
-        return {"status": "success", "message": f"{len(assignments)} channels assigned"}
+        assignments = assign_events_to_slots(
+            settings,
+            force_rebuild=True,
+            check_source=True,
+        )
 
-    def preview_action(self):
-        return {"status": "success", "message": preview()}
+        return {
+            "status": "success",
+            "message": f"{len(assignments)} channels assigned",
+        }
+
+    def next_scheduled_event_action(self, settings):
+        message = get_next_scheduled_event(settings)
+
+        return {
+            "status": "success",
+            "message": message,
+        }
 
     def clear_slots_action(self, settings):
         clear_slots(settings)
-        return {"status": "success", "message": "Slots cleared"}
 
-    def update_schedule_action(self, settings):
-        self.restart_scheduler(settings)
-        return {"status": "success", "message": "Scheduler restarted"}
+        return {"status": "success", "message": "Slots cleared"}
 
     def schedule_status_action(self, settings):
         global _scheduler_thread, _scheduler_settings, _scheduler_started_at
 
         running = bool(_scheduler_thread and _scheduler_thread.is_alive())
+
         lines = [
             f"running: {running}",
             f"thread: {getattr(_scheduler_thread, 'name', None)}",
@@ -339,8 +322,12 @@ class Plugin:
             f"minutes_before_event: {(settings or {}).get('minutes_before_event', 20)}",
             f"minutes_after_event: {(settings or {}).get('minutes_after_event', 20)}",
         ]
+
         if _scheduler_settings:
-            lines.append(f"active_settings_keys: {', '.join(sorted(_scheduler_settings.keys()))}")
+            lines.append(
+                f"active_settings_keys: {', '.join(sorted(_scheduler_settings.keys()))}"
+            )
+
         return {"status": "success", "message": "\n".join(lines)}
 
     def ensure_scheduler_running(self, settings):
@@ -354,20 +341,19 @@ class Plugin:
 
         with _scheduler_lock:
             if _scheduler_thread and _scheduler_thread.is_alive():
-                LOGGER.info("[EventSlotarr] Scheduler already running")
                 return True
 
-            LOGGER.info("[EventSlotarr] Scheduler is not running; starting automatically")
             self.restart_scheduler(settings)
-            return True
+
+        return True
 
     def stop_scheduler(self):
         global _scheduler_thread, _scheduler_settings, _scheduler_started_at
 
         with _scheduler_lock:
             if _scheduler_thread and _scheduler_thread.is_alive():
-                LOGGER.info("[EventSlotarr] Stopping scheduler")
                 _stop_scheduler.set()
+
                 try:
                     _scheduler_thread.join(timeout=5)
                 except Exception:
@@ -385,21 +371,24 @@ class Plugin:
 
         with _scheduler_lock:
             if _scheduler_thread and _scheduler_thread.is_alive():
-                LOGGER.info("[EventSlotarr] Restarting scheduler")
                 _stop_scheduler.set()
+
                 try:
                     _scheduler_thread.join(timeout=5)
                 except Exception:
                     LOGGER.exception("[EventSlotarr] Error while stopping old scheduler")
-                _stop_scheduler.clear()
+
+            _stop_scheduler.clear()
 
             _scheduler_settings = dict(settings)
             _scheduler_started_at = datetime.now().isoformat(timespec="seconds")
+
             _scheduler_thread = threading.Thread(
                 target=scheduler_loop,
                 args=(_scheduler_settings, _stop_scheduler),
                 daemon=True,
                 name="EventSlotarrScheduler",
             )
+
             _scheduler_thread.start()
-            LOGGER.info("[EventSlotarr] Scheduler thread started")
+
