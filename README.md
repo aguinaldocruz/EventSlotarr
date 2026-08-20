@@ -35,3 +35,10 @@ Examples:
 ## Important
 
 This is an initial generated plugin. Test in a non-critical profile first.
+
+
+## Secret storage
+
+The Plex token is encrypted with Fernet before EventSlotarr migrates it into Dispatcharr's `PluginConfig`. The encryption key is derived from Dispatcharr's `SECRET_KEY`; deployments may instead set a stable `EVENTSLOTARR_ENCRYPTION_KEY` environment variable containing a Fernet key. Keep that key stable: changing it makes previously stored tokens undecryptable.
+
+After installing this version, restart or reload the plugin once. It automatically migrates an existing plaintext `plex_token`. Rotate any token that was previously exposed, then save the replacement in the plugin settings.

@@ -23,6 +23,10 @@
     {
       "id": "schedule_status",
       "label": "Scheduler Status"
+    },
+    {
+      "id": "diagnose",
+      "label": "Diagnose Sources, Slots and EPG"
     }
   ]
 }

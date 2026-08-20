@@ -1,6 +1,8 @@
 import hashlib
 import json
 import logging
+import os
+import xml.etree.ElementTree as ET
 from datetime import timedelta
 
 from apps.channels.models import Channel, ChannelStream
@@ -20,6 +22,63 @@ from .xmltv import save_xmltv
 logger = logging.getLogger("plugins.eventslotarr")
 
 SCHEDULE_STATE_FILE = "schedule_state.json"
+
+def diagnose_system(params):
+    """Return a compact end-to-end report suitable for Dispatcharr logs/UI."""
+    groups = get_configured_source_groups(params)
+    group_reports = []
+    all_events = []
+    for group in groups:
+        events = load_events(group)
+        all_events.extend(events)
+        group_reports.append({
+            "configured": group,
+            "events": len(events),
+            "event_names": [f"{e['time']} - {e['event']}" for e in events[:20]],
+        })
+
+    slots = get_slot_channels(params)
+    slot_reports = []
+    for slot in slots:
+        streams = list(ChannelStream.objects.filter(channel=slot).order_by("order"))
+        slot_reports.append({
+            "name": slot.name,
+            "number": getattr(slot, "channel_number", None),
+            "epg_id": get_channel_epg_id(slot),
+            "stream_ids": [getattr(x.stream, "id", None) for x in streams],
+            "stream_names": [getattr(x.stream, "name", None) for x in streams],
+        })
+
+    timeline, ignored = allocate_events_to_slots(params, slots, all_events)
+    now = now_local(params)
+    due = []
+    for items in timeline.values():
+        item = find_due_item_for_slot(params, items)
+        if item:
+            due.append({"slot": item["slot"].name, "event": item["event"]["event"], "time": item["event"]["time"]})
+
+    xml_path = params.get("xmltv_output") or "/data/eventslotarr.xml"
+    xml_report = {"path": xml_path, "exists": os.path.exists(xml_path)}
+    if xml_report["exists"]:
+        xml_report["bytes"] = os.path.getsize(xml_path)
+        try:
+            root = ET.parse(xml_path).getroot()
+            xml_report["channels"] = len(root.findall("./channel"))
+            xml_report["programmes"] = len(root.findall("./programme"))
+        except Exception as ex:
+            xml_report["parse_error"] = str(ex)
+
+    return {
+        "now": now.isoformat(),
+        "groups": group_reports,
+        "events_total": len(all_events),
+        "slots": slot_reports,
+        "due": due,
+        "ignored": [f"{e.get('time')} - {e.get('event')}" for e in ignored],
+        "xmltv": xml_report,
+        "schedule_state": load_schedule_state(),
+    }
+
 
 def get_next_scheduled_event(params):
     all_day_events = load_all_events_for_day(params)
@@ -203,9 +262,11 @@ def replace_stream(slot_channel, source_stream):
         return False
 
     with transaction.atomic():
-        ChannelStream.objects.filter(channel=slot_channel).delete()
+        # Serialize scheduler/manual actions across Dispatcharr workers.
+        locked_channel = Channel.objects.select_for_update().get(pk=slot_channel.pk)
+        ChannelStream.objects.filter(channel=locked_channel).delete()
         ChannelStream.objects.create(
-            channel=slot_channel,
+            channel=locked_channel,
             stream=source_stream,
             order=0,
         )
@@ -220,12 +281,14 @@ def replace_stream(slot_channel, source_stream):
 
 
 def clear_channel(slot_channel):
-    qs = ChannelStream.objects.filter(channel=slot_channel)
+    with transaction.atomic():
+        locked_channel = Channel.objects.select_for_update().get(pk=slot_channel.pk)
+        qs = ChannelStream.objects.filter(channel=locked_channel)
 
-    if not qs.exists():
-        return False
+        if not qs.exists():
+            return False
 
-    qs.delete()
+        qs.delete()
 
     logger.info("[EventSlotarr] %s: cleared", slot_channel.name)
 

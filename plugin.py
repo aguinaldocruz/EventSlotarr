@@ -1,4 +1,5 @@
 import logging
+import json
 import threading
 from datetime import datetime
 
@@ -10,9 +11,11 @@ _scheduler_started_at = None
 _stop_scheduler = threading.Event()
 _scheduler_lock = threading.RLock()
 
+from .crypto import decrypt, encrypt, is_encrypted
 from .assignment import (
     assign_events_to_slots,
     clear_slots,
+    diagnose_system,
     get_next_scheduled_event,
 )
 from .scheduler import scheduler_loop
@@ -28,6 +31,7 @@ class Plugin:
         {"id": "next_scheduled_event", "label": "Next Scheduled Event"},
         {"id": "clear_slots", "label": "Clear Slots"},
         {"id": "schedule_status", "label": "Scheduler Status"},
+        {"id": "diagnose", "label": "Diagnose Sources, Slots and EPG"},
     ]
 
     def __init__(self):
@@ -223,17 +227,38 @@ class Plugin:
             LOGGER.warning("[EventSlotarr] No enabled PluginConfig found")
             return {}
 
-        return self._merge_defaults(config.settings or {})
+        raw_settings = dict(config.settings or {})
+        stored_token = raw_settings.get("plex_token")
+        if stored_token and not is_encrypted(stored_token):
+            try:
+                raw_settings["plex_token"] = encrypt(stored_token)
+                config.settings = raw_settings
+                config.save(update_fields=["settings", "updated_at"])
+                LOGGER.info("[EventSlotarr] Migrated Plex token to encrypted storage")
+            except Exception:
+                LOGGER.exception("[EventSlotarr] Could not encrypt Plex token; refusing to use persisted secret")
+                raw_settings["plex_token"] = ""
+
+        merged = self._merge_defaults(raw_settings)
+        if is_encrypted(merged.get("plex_token")):
+            merged["plex_token"] = decrypt(merged["plex_token"])
+        return merged
+
+    def _runtime_settings(self, settings):
+        merged = self._merge_defaults(settings)
+        if is_encrypted(merged.get("plex_token")):
+            merged["plex_token"] = decrypt(merged["plex_token"])
+        return merged
 
     def _resolve_settings(self, settings=None, context=None):
         if settings:
-            return self._merge_defaults(settings)
+            return self._runtime_settings(settings)
 
         if isinstance(context, dict):
             ctx_settings = context.get("settings")
 
             if ctx_settings:
-                return self._merge_defaults(ctx_settings)
+                return self._runtime_settings(ctx_settings)
 
         return self._load_persisted_settings()
 
@@ -275,11 +300,22 @@ class Plugin:
             if action == "schedule_status":
                 return self.schedule_status_action(settings)
 
+            if action == "diagnose":
+                return self.diagnose_action(settings)
+
             return {"status": "error", "message": f"Unknown action '{action}'"}
 
         except Exception as ex:
             LOGGER.exception("[EventSlotarr] Error running action %s: %s", action, ex)
             return {"status": "error", "message": str(ex)}
+
+    def diagnose_action(self, settings):
+        report = diagnose_system(settings)
+        return {
+            "status": "success",
+            "message": json.dumps(report, ensure_ascii=False, indent=2, default=str),
+            "report": report,
+        }
 
     def assign_events_action(self, settings):
         assignments = assign_events_to_slots(
