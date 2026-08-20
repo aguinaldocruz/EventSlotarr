@@ -8,7 +8,7 @@ from .quality import quality_score
 logger = logging.getLogger("EventSlotarr")
 
 EVENT_RE = re.compile(
-    r"(?P<time>\d{2}:\d{2})\s*-\s*(?P<event>.*?)\s*\[(?P<quality>.*?)\]",
+    r"^(?P<time>\d{2}:\d{2})\s*-\s*(?P<event>.*?)\s*\[(?P<quality>.*?)\]\s*$",
     re.IGNORECASE
 )
 
@@ -143,7 +143,13 @@ def load_events(source_group_name):
             logger.debug(f"Skipped non-event stream: {stream.name}")
             continue
 
-        key = normalize_event_name(parsed["event"])
+        hour, minute = (int(part) for part in parsed["time"].split(":"))
+        if hour > 23 or minute > 59:
+            skipped_non_event += 1
+            logger.warning("Skipped invalid event time: %s", stream.name)
+            continue
+
+        key = (parsed["time"], normalize_event_name(parsed["event"]))
 
         entry = {
             "stream": stream,

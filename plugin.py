@@ -13,10 +13,8 @@ _scheduler_lock = threading.RLock()
 from .assignment import (
     assign_events_to_slots,
     clear_slots,
-    get_configured_source_groups,
     get_next_scheduled_event,
 )
-from .parser import load_events
 from .scheduler import scheduler_loop
 
 

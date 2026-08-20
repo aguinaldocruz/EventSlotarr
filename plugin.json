@@ -1,6 +1,6 @@
 {
   "name": "EventSlotarr",
-  "version": "0.1.0",
+  "version": "0.2.3",
   "description": "Assign temporary live event streams to placeholder channels.",
   "author": "OpenAI",
   "license": "MIT",
@@ -9,46 +9,20 @@
   "fields": [],
   "actions": [
     {
-      "id": "validate_settings",
-      "label": "✅ Validate Settings",
-      "button_color": "blue",
-      "button_label": "Validate"
-    },
-    {
-      "id": "load_events",
-      "label": "📥 Load Events",
-      "button_color": "green",
-      "button_label": "Load"
-    },
-    {
       "id": "assign_events",
-      "label": "▶ Assign Events",
-      "button_color": "blue",
-      "button_label": "Assign",
-      "confirm": {
-        "message": "Assign event streams to placeholder channels?"
-      }
+      "label": "Assign Events Now"
     },
     {
-      "id": "preview",
-      "label": "📊 Preview",
-      "button_color": "blue",
-      "button_label": "Preview"
+      "id": "next_scheduled_event",
+      "label": "Next Scheduled Event"
     },
     {
       "id": "clear_slots",
-      "label": "🗑 Clear Slots",
-      "button_color": "red",
-      "button_label": "Clear",
-      "confirm": {
-        "message": "Remove streams from all placeholder channels?"
-      }
+      "label": "Clear Slots"
     },
     {
-      "id": "update_schedule",
-      "label": "📅 Update Schedule",
-      "button_color": "green",
-      "button_label": "Save Schedule"
+      "id": "schedule_status",
+      "label": "Scheduler Status"
     }
   ]
 }

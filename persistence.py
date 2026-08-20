@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import tempfile
 
 logger = logging.getLogger("EventSlotarr")
 
@@ -31,8 +32,21 @@ def save_json(filename, data):
     path = _path(filename)
 
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        directory = os.path.dirname(path) or "."
+        temporary_path = None
+        fd, temporary_path = tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, path)
+        return True
 
     except Exception as ex:
         logger.exception(f"Failed saving {filename}: {ex}")
+        try:
+            if temporary_path:
+                os.unlink(temporary_path)
+        except OSError:
+            pass
+        return False

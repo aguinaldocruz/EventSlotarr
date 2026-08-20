@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import timedelta
 
 from .assignment import assign_events_to_slots, seconds_until_next_slot_change
@@ -39,6 +40,27 @@ def _seconds_until_beginning_day(params):
 
 
 def scheduler_loop(params, stop_event):
+    """Run one scheduler process-wide; Dispatcharr may load plugins in many workers."""
+    lock_path = os.path.join(os.path.dirname(__file__), "data", "scheduler.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    try:
+        import fcntl
+    except ImportError:
+        return _scheduler_loop_impl(params, stop_event)
+
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.warning("[EventSlotarr] Scheduler already active in another worker")
+            return
+        try:
+            return _scheduler_loop_impl(params, stop_event)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _scheduler_loop_impl(params, stop_event):
     check_minutes = _int_setting(params, "source_change_check_minutes", 30)
     check_seconds = max(check_minutes * 60, 60)
 
